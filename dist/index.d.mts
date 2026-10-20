@@ -29,6 +29,22 @@ export declare class ActiveCall extends EventEmitter {
     waitForEnd: () => Promise<string>;
     /** @internal — called by VoipClient on WASM call-state change */
     _updateState: (state: number) => void;
+    /**
+     * @internal — the callee's side ended a call that was never answered. WhatsApp tells us with a `reject` (declined)
+     * or a `terminate` (`reason="timeout"` when it rang out) stanza, and the engine does not always turn either into a
+     * state change, so without this the call would ring until the caller's own timeout. An answered call is left to the engine.
+     * Ends through `end()`, not `_forceEnd()`: the engine must leave the call too, or it ignores the next `startCall` and
+     * that call never rings.
+     */
+    _peerEnded: (tag: string, reason?: string) => void;
+    /**
+     * @internal — notes why the callee's side is ending an unanswered call, before its stanza reaches the engine. The
+     * engine may react to that stanza with a state change that ends the call first, and that change alone says only
+     * "ended"; with the note it reports `no_answer` / `remote_end` like `_peerEnded` would.
+     */
+    _notePeerEnd: (tag: string, reason?: string) => void;
+    /** @internal — engine event 11: the callee declined. */
+    _peerRejected: () => void;
     /** @internal */
     _emitAudio: (pcm: Float32Array) => void;
     /** @internal */
@@ -53,6 +69,13 @@ export declare class VoipClient {
     write: (pcm: Float32Array) => void;
     /** True once the socket is open — a populated `authDir` opens without a QR scan. */
     isOpen: () => boolean;
+    /**
+     * Why the socket is down after having been open, or null while it is open (or was never opened):
+     * `"reconnecting"` while it is being reopened, or the reason it was given up on — `"logged_out"`, `"replaced"`,
+     * `"forbidden"`, `"bad_session"`, `"multidevice_mismatch"`. A given-up socket stays down until `connect()` runs
+     * again in a new client (in practice: the service restarts, or the worker is re-linked).
+     */
+    disconnectReason: () => string | null;
     /** Tear down the WhatsApp socket and release resources. */
     disconnect: () => void;
 }

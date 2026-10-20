@@ -416,7 +416,11 @@ export class RelayRtcTransport {
     if (connection.state === "open" || connection.state === "connecting") {
       return connection.connectPromise ?? Promise.resolve();
     }
-    const promise = this.#connect(connection);
+    // Callers fire and forget, so a rejection here would be unhandled and take the whole process down. A connect
+    // that fails just leaves the connection `failed`; the next packet or relay update tries again.
+    const promise = this.#connect(connection).catch(() => {
+      if (connection.state === "connecting") connection.state = "failed";
+    });
     connection.connectPromise = promise;
     try { await promise; } finally { connection.connectPromise = null; }
   };
@@ -481,8 +485,13 @@ export class RelayRtcTransport {
       }
     }, CONNECTION_TIMEOUT_MS);
 
+    // The connection can be closed or replaced while we wait (relay list update, timeout, call end); touching the
+    // closed peer connection after that throws, so stop as soon as it is no longer ours.
+    const superseded = (): boolean => connection.peerConnection !== pc;
     const offer = await pc.createOffer();
+    if (superseded()) return;
     await pc.setLocalDescription(offer);
+    if (superseded()) return;
     const remoteSdp = buildRemoteRelayAnswer(offer.sdp ?? "", {
       ...connection.info,
       port: getRtcConnectPort(connection.info),

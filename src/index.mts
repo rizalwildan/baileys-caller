@@ -83,6 +83,8 @@ export class ActiveCall extends EventEmitter {
   readonly #endPromise: Promise<string>;
   #endTimer: NodeJS.Timeout | null = null;
   #ended = false;
+  /** Why the callee's side ended the call, noted from its stanza before the engine sees it; null until then. */
+  #peerEndReason: string | null = null;
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
@@ -122,8 +124,35 @@ export class ActiveCall extends EventEmitter {
     if (state === CallState.PreacceptReceived) this.emit("ringing");
     else if (state === CallState.Active) this.emit("connected");
     else if (state === CallState.Idle || state === CallState.Ending) {
-      this._forceEnd("ended");
+      this._forceEnd(this.#peerEndReason ?? "ended");
     }
+  };
+
+  /**
+   * @internal — the callee's side ended a call that was never answered. WhatsApp tells us with a `reject` (declined)
+   * or a `terminate` (`reason="timeout"` when it rang out) stanza, and the engine does not always turn either into a
+   * state change, so without this the call would ring until the caller's own timeout. An answered call is left to the engine.
+   * Ends through `end()`, not `_forceEnd()`: the engine must leave the call too, or it ignores the next `startCall` and
+   * that call never rings.
+   */
+  _peerEnded = (tag: string, reason?: string): void => {
+    if (this.#state === CallState.Active) return;
+    this.end(peerEndReason(tag, reason));
+  };
+
+  /**
+   * @internal — notes why the callee's side is ending an unanswered call, before its stanza reaches the engine. The
+   * engine may react to that stanza with a state change that ends the call first, and that change alone says only
+   * "ended"; with the note it reports `no_answer` / `remote_end` like `_peerEnded` would.
+   */
+  _notePeerEnd = (tag: string, reason?: string): void => {
+    if (this.#state === CallState.Active) return;
+    this.#peerEndReason ??= peerEndReason(tag, reason);
+  };
+
+  /** @internal — engine event 11: the callee declined. */
+  _peerRejected = (): void => {
+    this._peerEnded("reject");
   };
 
   /** @internal */
@@ -139,6 +168,36 @@ export class ActiveCall extends EventEmitter {
   };
 }
 
+/** Disconnects after which reopening is pointless or harmful, by the reason `disconnectReason()` reports. */
+const TERMINAL_DISCONNECT_REASONS = new Map<number, string>([
+  [401, "logged_out"], // unlinked from the phone: needs a new QR
+  [440, "replaced"], // another session took over these credentials; reopening would fight it
+  [403, "forbidden"], // the account is banned
+]);
+
+/**
+ * Refusals from WhatsApp's side that a reconnect seldom fixes (a corrupt session, a device-list mismatch). Every
+ * attempt reaches WhatsApp, and logging in again and again looks like abuse, so they are given up on after
+ * `SERVER_REJECT_LIMIT` in a row.
+ */
+const SERVER_REJECT_REASONS = new Map<number, string>([
+  [500, "bad_session"],
+  [411, "multidevice_mismatch"],
+]);
+const SERVER_REJECT_LIMIT = 3;
+
+/**
+ * Pause before each reconnect attempt; the last value repeats until the socket is back. Attempts made while the
+ * network is down never reach WhatsApp, so retrying forever is cheap — the long tail just keeps a worker that
+ * stays offline for hours from spinning.
+ */
+const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 30_000, 30_000, 60_000, 120_000, 300_000];
+
+/** `terminate` with `reason="timeout"` means it rang out; anything else (a `reject`, a busy line) is the callee's doing. */
+function peerEndReason(tag: string, reason?: string): string {
+  return tag === "terminate" && reason === "timeout" ? "no_answer" : "remote_end";
+}
+
 /** Top-level client. Connects to WhatsApp and lets you place calls. */
 export class VoipClient {
   readonly #config: VoipSdkConfig;
@@ -149,6 +208,15 @@ export class VoipClient {
   #activeCall: ActiveCall | null = null;
   #baileys: any = null;
   #open = false;
+  /** Builds a fresh socket over the same auth state; kept so a dropped socket can be replaced without a QR. */
+  #createSocket: (() => any) | null = null;
+  /** Set by `disconnect()`: a socket closing after that is expected and must not be reopened. */
+  #closing = false;
+  #reconnectTimer: NodeJS.Timeout | null = null;
+  #reconnectAttempt = 0;
+  /** Consecutive `SERVER_REJECT_REASONS` closes; any other close resets it. */
+  #serverRejects = 0;
+  #disconnectReason: string | null = null;
 
   // Capture state populated when WASM negotiates audio params
   #capturePtr = 0;
@@ -183,11 +251,17 @@ export class VoipClient {
       fatal: () => {},
     };
 
-    const createSocket = () => makeSocket({
-      auth: state,
-      emitOwnEvents: true,
-      logger: silentLogger,
-    });
+    const createSocket = () => {
+      const sock = makeSocket({
+        auth: state,
+        emitOwnEvents: true,
+        logger: silentLogger,
+      });
+      sock.ev.on("creds.update", saveCreds);
+      return sock;
+    };
+    this.#createSocket = createSocket;
+    this.#closing = false;
 
     // Connect with auto-reconnect on the post-QR 515 stream-error path.
     await new Promise<void>((resolveOpen, rejectOpen) => {
@@ -196,8 +270,8 @@ export class VoipClient {
       const maxRetries = 5;
 
       const connectSocket = () => {
-        this.#sock = createSocket();
-        this.#sock.ev.on("creds.update", saveCreds);
+        const sock = createSocket();
+        this.#sock = sock;
 
         process.removeAllListeners("uncaughtException");
         process.on("uncaughtException", (err: any) => {
@@ -210,7 +284,9 @@ export class VoipClient {
           }
         });
 
-        this.#sock.ev.on("connection.update", (update: any) => {
+        sock.ev.on("connection.update", (update: any) => {
+          // A replaced socket can still report; only the current one counts.
+          if (sock !== this.#sock) return;
           if (update.qr) {
             if (this.#config.onQr) this.#config.onQr(update.qr);
             else
@@ -226,6 +302,10 @@ export class VoipClient {
             opened = true;
             process.removeAllListeners("uncaughtException");
             resolveOpen();
+            return;
+          }
+          if (update.connection === "close" && opened) {
+            this.#handleSocketClosed(update.lastDisconnect?.error);
             return;
           }
           if (update.connection === "close" && !opened) {
@@ -246,8 +326,7 @@ export class VoipClient {
       connectSocket();
     });
 
-    this.#signaling = new SignalingBridge({ sock: this.#sock });
-    await this.#signaling.init();
+    await this.#bindSocket(this.#sock);
 
     this.#relay = new RelayRtcTransport({
       onTransportMessage: (data, ip, port) => this.#engine?.handleOnTransportMessage(data, ip, port),
@@ -270,7 +349,7 @@ export class VoipClient {
     });
 
     await this.#engine.initialize();
-    this.#signaling.attachEngine(this.#engine);
+    this.#signaling!.attachEngine(this.#engine);
 
     const selfPnJid = this.#sock.authState.creds.me?.id;
     const selfLidJid = this.#sock.authState.creds.me?.lid;
@@ -278,13 +357,6 @@ export class VoipClient {
     await this.#engine.waitForVoipStackReady();
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
-    this.#sock.ws.on("CB:call", (node: any) => {
-      this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
-    });
-    this.#sock.ws.on("CB:receipt", (node: any) => {
-      if (!isCallReceiptNode(node)) return;
-      this.#signaling!.processIncomingReceipt(node, this.#engine!, this.#activeCall?.callId ?? "");
-    });
   };
 
   /** Place an outbound voice call. */
@@ -355,8 +427,18 @@ export class VoipClient {
   /** True once the socket is open — a populated `authDir` opens without a QR scan. */
   isOpen = (): boolean => this.#open;
 
+  /**
+   * Why the socket is down after having been open, or null while it is open (or was never opened):
+   * `"reconnecting"` while it is being reopened, or the reason it was given up on — `"logged_out"`, `"replaced"`,
+   * `"forbidden"`, `"bad_session"`, `"multidevice_mismatch"`. A given-up socket stays down until `connect()` runs
+   * again in a new client (in practice: the service restarts, or the worker is re-linked).
+   */
+  disconnectReason = (): string | null => this.#disconnectReason;
+
   /** Tear down the WhatsApp socket and release resources. */
   disconnect = (): void => {
+    this.#closing = true;
+    if (this.#reconnectTimer) { clearTimeout(this.#reconnectTimer); this.#reconnectTimer = null; }
     this.#open = false;
     this.#activeCall?._forceEnd("disconnect");
     this.#activeCall = null;
@@ -370,6 +452,107 @@ export class VoipClient {
   };
 
   // ─── private ──────────────────────────────────────────────────────────────
+
+  /**
+   * Wires a freshly opened socket: a signaling bridge of its own (the bridge hooks that socket's key store) and the
+   * call/receipt listeners on its websocket. The WASM engine and relay transport outlive sockets and are reused.
+   */
+  #bindSocket = async (sock: any): Promise<void> => {
+    const signaling = new SignalingBridge({ sock });
+    await signaling.init();
+    if (this.#engine) signaling.attachEngine(this.#engine);
+    this.#signaling = signaling;
+
+    sock.ws.on("CB:call", (node: any) => {
+      if (!this.#engine || sock !== this.#sock) return;
+      const child = Array.isArray(node.content) ? node.content[0] : null;
+      const callId = child?.attrs?.["call-id"] ?? child?.attrs?.call_id;
+      const peerEnd = (child?.tag === "reject" || child?.tag === "terminate") && callId && callId === this.#activeCall?.callId
+        ? this.#activeCall
+        : null;
+      // Noted before the engine sees the stanza: its state change can end the call before we get another chance.
+      peerEnd?._notePeerEnd(child.tag, child.attrs.reason);
+      this.#signaling!.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
+      // When the engine does not end the call on its own, end it here.
+      peerEnd?._peerEnded(child.tag, child.attrs.reason);
+    });
+    sock.ws.on("CB:receipt", (node: any) => {
+      if (!this.#engine || sock !== this.#sock) return;
+      if (!isCallReceiptNode(node)) return;
+      this.#signaling!.processIncomingReceipt(node, this.#engine, this.#activeCall?.callId ?? "");
+    });
+  };
+
+  /**
+   * The socket dropped after it had been open. Report offline at once (so no call is placed on a dead socket), end
+   * a call in progress, and reopen unless WhatsApp said this session is over: logged out (401), replaced by another
+   * session on the same credentials (440 — reopening would fight it), or the account is banned (403).
+   */
+  #handleSocketClosed = (error: any): void => {
+    this.#open = false;
+    this.#activeCall?.end("disconnect");
+    if (this.#closing) return;
+    const statusCode = error?.output?.statusCode;
+    const terminal = TERMINAL_DISCONNECT_REASONS.get(statusCode);
+    if (terminal) {
+      this.#giveUp(statusCode, terminal);
+      return;
+    }
+    const rejected = SERVER_REJECT_REASONS.get(statusCode);
+    this.#serverRejects = rejected ? this.#serverRejects + 1 : 0;
+    if (rejected && this.#serverRejects >= SERVER_REJECT_LIMIT) {
+      this.#giveUp(statusCode, rejected);
+      return;
+    }
+    this.#disconnectReason = "reconnecting";
+    console.warn(`WhatsApp socket closed (${statusCode ?? "unknown"}); reconnecting`, { authDir: this.#config.authDir });
+    this.#scheduleReconnect();
+  };
+
+  #giveUp = (statusCode: number, reason: string): void => {
+    this.#disconnectReason = reason;
+    console.error(`WhatsApp session ended (${statusCode} ${reason}); not reconnecting`, { authDir: this.#config.authDir });
+  };
+
+  #scheduleReconnect = (): void => {
+    if (this.#closing || this.#reconnectTimer) return;
+    const delay = RECONNECT_BACKOFF_MS[Math.min(this.#reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)]!;
+    this.#reconnectAttempt += 1;
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      this.#reopenSocket();
+    }, delay);
+  };
+
+  /** Opens a replacement socket from the same authDir (no QR); on open it is bound like the first one. */
+  #reopenSocket = (): void => {
+    if (this.#closing || !this.#createSocket) return;
+    const sock = this.#createSocket();
+    this.#sock = sock;
+    sock.ev.on("connection.update", (update: any) => {
+      if (sock !== this.#sock || this.#closing) return;
+      if (update.connection === "open") {
+        void this.#bindSocket(sock).then(
+          () => {
+            if (sock !== this.#sock || this.#closing) return;
+            this.#reconnectAttempt = 0;
+            this.#serverRejects = 0;
+            this.#disconnectReason = null;
+            this.#open = true;
+            console.warn("WhatsApp socket reconnected", { authDir: this.#config.authDir });
+          },
+          (bindError: unknown) => {
+            console.error("WhatsApp socket reopened but could not be bound; retrying", bindError);
+            try { sock.end?.(undefined); } catch {}
+          },
+        );
+        return;
+      }
+      if (update.connection === "close") {
+        this.#handleSocketClosed(update.lastDisconnect?.error);
+      }
+    });
+  };
 
   #handleCallEvent = (eventType: number, eventData?: string): void => {
     if (eventType === 16 && eventData) {
@@ -386,6 +569,8 @@ export class VoipClient {
       } catch {}
     } else if (eventType === 2) {
       this.#activeCall?._forceEnd("remote_end");
+    } else if (eventType === 11) {
+      this.#activeCall?._peerRejected();
     }
   };
 
